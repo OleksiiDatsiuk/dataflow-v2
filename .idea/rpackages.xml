@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="RPackageService">
+    <option name="enabledRepositoryUrls">
+      <list>
+        <option value="@CRAN@" />
+        <option value="https://bioconductor.org/packages/3.19/bioc" />
+        <option value="https://bioconductor.org/packages/3.19/data/annotation" />
+        <option value="https://bioconductor.org/packages/3.19/data/experiment" />
+        <option value="https://www.stats.ox.ac.uk/pub/RWin" />
+        <option value="https://R-Forge.R-project.org" />
+        <option value="https://www.rforge.net" />
+      </list>
+    </option>
+  </component>
+</project>
