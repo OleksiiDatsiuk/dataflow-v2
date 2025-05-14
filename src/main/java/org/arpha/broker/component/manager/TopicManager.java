@@ -16,4 +16,5 @@ public interface TopicManager {
     List<Topic> getAllTopics();
     void subscribeToTopic(String topicName, BiConsumer<String, Integer> subscriber);
 
+    String getMessageAtOffset(String topic, int partition, long offset);
 }

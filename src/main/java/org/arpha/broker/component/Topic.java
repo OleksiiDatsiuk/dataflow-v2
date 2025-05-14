@@ -46,4 +46,11 @@ public class Topic {
                 .findFirst()
                 .map(Partition::getNextMessage);
     }
+
+    public Partition getPartition(int partition) {
+        return partitions.stream().filter(p -> p.getPartitionId() == partition)
+                .findFirst()
+                .orElseThrow(() -> new IllegalArgumentException("Partition not found"));
+    }
+
 }

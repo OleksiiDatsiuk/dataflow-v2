@@ -64,6 +64,17 @@ public class InMemoryTopicManager implements TopicManager {
         return null;
     }
 
+    public String getMessageAtOffset(String topicName, int partition, long offset) {
+        Topic topic = topics.get(topicName);
+        if (topic == null) return null;
+
+        List<String> messages = topic.getPartition(partition).getMessages().stream().toList();
+        if (offset < 0 || offset >= messages.size()) return null;
+
+        return messages.get((int) offset);
+    }
+
+
     @Override
     public Optional<Topic> getTopic(String topicName) {
         return Optional.ofNullable(topics.get(topicName));

@@ -8,6 +8,7 @@ public enum MessageType {
     UNKNOWN,
     BROKER_REGISTRATION,
     BROKER_ACK,
-    FOLLOWER_HEARTBEAT
+    FOLLOWER_HEARTBEAT,
+    REPLICA
 
 }
