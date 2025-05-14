@@ -6,6 +6,8 @@ import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.http.*;
 
+import java.util.Map;
+
 import static io.netty.util.CharsetUtil.UTF_8;
 
 public class SseStream {
@@ -34,9 +36,17 @@ public class SseStream {
         ctx.writeAndFlush(response);
     }
 
-    public void sendEvent(Object event) {
+    public void sendEvent(Object event, Integer partitionId) {
         try {
-            String json = objectMapper.writeValueAsString(event);
+            Object payload;
+
+            if (event instanceof String) {
+                payload = Map.of("message", event, "partition", partitionId);
+            } else {
+                payload = event;
+            }
+
+            String json = objectMapper.writeValueAsString(payload);
             String formatted = "data: " + json + "\n\n";
 
             ByteBuf buf = Unpooled.copiedBuffer(formatted, UTF_8);
@@ -45,4 +55,5 @@ public class SseStream {
             e.printStackTrace();
         }
     }
+
 }

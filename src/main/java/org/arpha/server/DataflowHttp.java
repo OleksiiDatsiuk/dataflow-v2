@@ -13,6 +13,7 @@ import io.netty.handler.codec.http.HttpServerCodec;
 import io.netty.handler.stream.ChunkedWriteHandler;
 import lombok.RequiredArgsConstructor;
 import org.arpha.broker.component.manager.TopicManager;
+import org.arpha.http.endpoint.controller.ClusterMetadataController;
 import org.arpha.http.routing.Router;
 import org.arpha.http.endpoint.controller.TopicController;
 import org.arpha.http.routing.DispatcherHandler;
@@ -25,6 +26,7 @@ public class DataflowHttp {
     public DataflowHttp(TopicManager topicManager) {
         this.router = new Router();
         this.router.registerController(new TopicController(topicManager));
+        this.router.registerController(new ClusterMetadataController(topicManager));
     }
 
     public void start(int port) throws InterruptedException {

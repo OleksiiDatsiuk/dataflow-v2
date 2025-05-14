@@ -4,7 +4,7 @@ import org.arpha.broker.component.Topic;
 
 import java.util.List;
 import java.util.Optional;
-import java.util.function.Consumer;
+import java.util.function.BiConsumer;
 
 public interface TopicManager {
 
@@ -14,6 +14,6 @@ public interface TopicManager {
     Topic createTopic(String topicName, int numberOfPartitions);
 
     List<Topic> getAllTopics();
-    void subscribeToTopic(String topicName, Consumer<String> subscriber);
+    void subscribeToTopic(String topicName, BiConsumer<String, Integer> subscriber);
 
 }

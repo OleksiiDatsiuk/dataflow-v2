@@ -1,9 +1,13 @@
 package org.arpha.broker.handler;
 
 public enum MessageType {
+
     PRODUCER,
     CONSUMER,
     BROKER,
-    UNKNOWN;
+    UNKNOWN,
+    BROKER_REGISTRATION,
+    BROKER_ACK,
+    FOLLOWER_HEARTBEAT
 
 }

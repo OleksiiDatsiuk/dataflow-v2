@@ -1,5 +1,7 @@
 plugins {
     id 'java'
+    id 'application'
+    id 'com.github.johnrengelman.shadow' version '8.1.1'
 }
 
 group = 'org.arpha'
@@ -9,13 +11,44 @@ repositories {
     mavenCentral()
 }
 
+application {
+    mainClass = 'org.arpha.BrokerRunner'
+}
+
+jar {
+    manifest {
+        attributes(
+                'Main-Class': 'org.arpha.BrokerRunner'
+        )
+    }
+}
+
+shadowJar {
+    archiveBaseName.set('dataflow-new')
+    archiveClassifier.set('')
+    archiveVersion.set('1.0-SNAPSHOT')
+}
+
+tasks.named('distZip') {
+    dependsOn shadowJar
+}
+tasks.named('distTar') {
+    dependsOn shadowJar
+}
+tasks.named('startScripts') {
+    dependsOn shadowJar
+}
+tasks.named('startShadowScripts') {
+    dependsOn tasks.named('jar')
+}
+
+
 dependencies {
     implementation 'io.netty:netty-all:4.1.114.Final'
     implementation 'org.apache.commons:commons-lang3:3.17.0'
     implementation 'com.fasterxml.jackson.core:jackson-databind:2.18.1'
 
     implementation 'org.slf4j:slf4j-api:2.0.16'
-
     runtimeOnly 'org.slf4j:slf4j-simple:2.0.16'
 
     compileOnly 'org.projectlombok:lombok:1.18.28'

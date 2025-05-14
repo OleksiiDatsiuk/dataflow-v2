@@ -37,7 +37,7 @@ public class TopicController {
     public SseStream streamTopic(@PathParam("topicName") String topicName, ChannelHandlerContext ctx) {
         SseStream sseStream = new SseStream(ctx);
         topicManager.subscribeToTopic(topicName, sseStream::sendEvent);
-        sseStream.sendEvent("Subscribed to topic " + topicName);
+        sseStream.sendEvent("Subscribed to topic " + topicName, 1);
         return sseStream;
     }
 
