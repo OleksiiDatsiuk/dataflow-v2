@@ -33,7 +33,6 @@ public class BrokerRunner {
 
         TopicManager topicManager = new InMemoryTopicManager(new FileBasedPersistentStorage());
         ClusterManager clusterManager = getClusterManager(brokerProperties);
-        ClusterContext.set(clusterManager);
 
         MessageBrokerHandler messageHandler = new MessageBrokerHandler(topicManager);
         ClusterClient.tryConnectToLeaderIfNotLeader(messageHandler);
@@ -46,7 +45,7 @@ public class BrokerRunner {
 
         Runnable brokerTask = () -> {
             try {
-                new MessageBroker(brokerProperties.getPort(), topicManager).start();
+                new MessageBroker(brokerProperties.getPort(), messageHandler).start();
             } catch (InterruptedException e) {
                 throw new IllegalArgumentException(e);
             }
@@ -75,6 +74,8 @@ public class BrokerRunner {
 
         if (brokerProperties.isLeader()) {
             clusterManager.markAsLeader();
+            clusterManager.registerBroker(brokerProperties.getId(),
+                    brokerProperties.getHost() + ":" + brokerProperties.getPort(), ClusterManager.BrokerStatus.LEADER);
         }
 
         ClusterContext.set(clusterManager);

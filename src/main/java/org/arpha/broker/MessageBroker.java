@@ -4,17 +4,16 @@ import io.netty.channel.ChannelPipeline;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.handler.codec.string.StringDecoder;
 import io.netty.handler.codec.string.StringEncoder;
-import org.arpha.broker.component.manager.TopicManager;
 import org.arpha.broker.handler.MessageBrokerHandler;
 import org.arpha.server.AbstractNettyServer;
 
 public class MessageBroker extends AbstractNettyServer {
 
-    private final TopicManager topicManager;
+    private final MessageBrokerHandler messageBrokerHandler;
 
-    public MessageBroker(int port, TopicManager topicManager) {
+    public MessageBroker(int port, MessageBrokerHandler messageBrokerHandler) {
         super(port);
-        this.topicManager = topicManager;
+        this.messageBrokerHandler = messageBrokerHandler;
     }
 
     @Override
@@ -22,7 +21,7 @@ public class MessageBroker extends AbstractNettyServer {
         ChannelPipeline pipeline = socketChannel.pipeline();
         pipeline.addLast(new StringDecoder());
         pipeline.addLast(new StringEncoder());
-        pipeline.addLast(new MessageBrokerHandler(topicManager));
+        pipeline.addLast(messageBrokerHandler);
     }
 
 }

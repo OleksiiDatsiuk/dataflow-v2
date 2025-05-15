@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelPipeline;
@@ -35,6 +36,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 
 @Slf4j
+@ChannelHandler.Sharable
 public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
 
     private static volatile boolean isRegistered = false;
@@ -260,8 +262,6 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
         committedOffsets
                 .computeIfAbsent(msg.getConsumerGroup(), k -> new ConcurrentHashMap<>())
                 .put(msg.getPartition(), msg.getOffset());
-
-        ctx.writeAndFlush("{\"status\":\"committed\"}\n");
     }
 
     private int assignPartitionRoundRobin(String topic, String group) {
@@ -304,7 +304,8 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
                 return;
             }
 
-            clusterManager.registerBroker(dto.getBrokerId(), dto.getAddress());
+            clusterManager.registerBroker(dto.getBrokerId(), dto.getAddress(),
+                    ClusterManager.BrokerStatus.FOLLOWER);
             log.info("Registered broker {} at {}", dto.getBrokerId(), dto.getAddress());
 
             Message ack = new Message(MessageType.BROKER_ACK, null, "ACK: Registered broker " + dto.getBrokerId());
@@ -324,12 +325,10 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
             ObjectMapper mapper = new ObjectMapper();
             Map<String, Integer> payload = mapper.readValue(message.getContent(), Map.class);
             int brokerId = payload.get("brokerId");
-            log.info("Handling hearbeat message from broker {}", brokerId);
 
             ClusterManager clusterManager = ClusterContext.get();
             if (clusterManager.isLeader()) {
                 clusterManager.getHeartbeatTimestamps().put(brokerId, System.currentTimeMillis());
-                log.info("Heartbeat received from broker {}", brokerId);
             }
         } catch (Exception e) {
             log.warn("Failed to parse heartbeat message: {}", message.getContent(), e);
@@ -416,6 +415,7 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
             int brokerId = brokerIds.get(i % brokerIds.size());
             assignments.put(i, brokerId);
         }
+        log.info("[FUCK] Assigned topic {}, map = {}", topic, assignments);
         partitionAssignments.put(topic, assignments);
     }
 

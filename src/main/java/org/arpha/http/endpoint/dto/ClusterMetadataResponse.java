@@ -35,10 +35,15 @@ public class ClusterMetadataResponse {
                     String status = (lastHeartbeat != -1L && (now - lastHeartbeat) <= heartbeatTimeoutMillis)
                             ? "ONLINE" : "OFFLINE";
 
+                    if (brokerId == clusterManager.getBrokerId()) {
+                        status = "ONLINE";
+                    }
+
                     return new BrokerInfo(
                             brokerId,
                             entry.getValue(),
                             status,
+                            statuses.getOrDefault(brokerId, ClusterManager.BrokerStatus.UNKNOWN).name(),
                             lastHeartbeat
                     );
                 })
@@ -72,6 +77,7 @@ public class ClusterMetadataResponse {
         private int brokerId;
         private String address;
         private String status;
+        private String type;
         private long lastHeartbeat;
     }
 

@@ -52,9 +52,9 @@ public class ClusterManager {
         return registeredBrokers;
     }
 
-    public void registerBroker(int id, String address) {
+    public void registerBroker(int id, String address, BrokerStatus brokerStatus) {
         registeredBrokers.put(id, address);
-        brokerStatuses.put(id, BrokerStatus.FOLLOWER);
+        brokerStatuses.put(id, brokerStatus);
     }
 
     public Map<Integer, BrokerStatus> getBrokerStatuses() {
