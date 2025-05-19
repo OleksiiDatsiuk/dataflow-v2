@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInitializer;
@@ -13,8 +14,10 @@ import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.handler.codec.LineBasedFrameDecoder;
 import io.netty.handler.codec.string.StringDecoder;
 import io.netty.handler.codec.string.StringEncoder;
+import io.netty.util.CharsetUtil;
 import lombok.extern.slf4j.Slf4j;
 import org.arpha.broker.component.Topic;
 import org.arpha.broker.component.manager.TopicManager;
@@ -26,6 +29,7 @@ import org.arpha.cluster.ClusterContext;
 import org.arpha.cluster.ClusterManager;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -36,6 +40,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 @Slf4j
 @ChannelHandler.Sharable
@@ -48,10 +53,17 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
     private final Map<Channel, MessageType> connectionRegistry;
     private final BlockingQueue<MessageTask> messageQueue;
     private final ExecutorService executorService;
+
+    // Key: GroupID, Value: Map<PartitionID, Offset>
     private final Map<String, Map<Integer, Long>> committedOffsets = new ConcurrentHashMap<>();
-    private final Map<String, Map<String, Integer>> consumerAssignments = new ConcurrentHashMap<>();
+
+    // Key: GroupID, Value: Map<ConsumerID, List<PartitionID>>
+    private final Map<String, Map<String, List<Integer>>> consumerAssignments = new ConcurrentHashMap<>();
+
     private final Map<Integer, CompletableFuture<String>> registrationAcks = new ConcurrentHashMap<>();
     private final Map<String, Map<String, Long>> consumerHeartbeats = new ConcurrentHashMap<>();
+
+    // Key: TopicName, Value: Map<PartitionID, BrokerID (Owner)>
     private final Map<String, Map<Integer, Integer>> partitionAssignments = new ConcurrentHashMap<>();
 
     private volatile Channel leaderChannel;
@@ -97,27 +109,39 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, String rawMessage) {
         try {
+            // Basic check for excessively long messages to prevent OOM from LineBasedFrameDecoder if max length is huge
+            if (rawMessage.length() > 1024 * 1024) { // Example: 1MB limit per message string
+                log.warn("Received overly long message ({} bytes) on channel {}. Potential framing issue or attack. Closing channel.", rawMessage.length(), ctx.channel().id());
+                ctx.close();
+                return;
+            }
             messageQueue.put(new MessageTask(ctx, rawMessage));
         } catch (InterruptedException e) {
             log.error("Failed to enqueue message: {}", rawMessage, e);
             Thread.currentThread().interrupt();
+        }  catch (Exception e) {
+            log.error("Unexpected error in channelRead0 for raw message '{}' on channel {}: {}", rawMessage, ctx.channel().id(), e.getMessage(), e);
+            ctx.close(); // Close on other unexpected errors during enqueue attempt
         }
     }
 
     private void startMessageProcessing() {
-        int numProcessingThreads = 4;
+        int numProcessingThreads = 4; // Consider making this configurable
         for (int i = 0; i < numProcessingThreads; i++) {
             executorService.submit(() -> {
+                MessageTask task = null; // For logging in catch block
                 while (!Thread.currentThread().isInterrupted()) {
                     try {
-                        MessageTask task = messageQueue.take();
+                        task = messageQueue.take();
                         processMessageTask(task);
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                         log.error("Message processing thread interrupted, stopping.", e);
                         break;
                     } catch (Exception e) {
-                        log.error("Exception during message task processing", e);
+                        log.error("Unhandled exception during message task processing for message: '{}'", (task != null ? task.getRawMessage() : "UNKNOWN_TASK"), e);
+                        // Depending on the severity, this thread might need to be restarted, or the error handled more gracefully.
+                        // For now, the loop continues, but this indicates a bug in processMessageTask or its sub-handlers.
                     }
                 }
                 log.info("Message processing thread finished.");
@@ -126,9 +150,12 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
     }
 
     public CompletableFuture<String> registerWithLeader(Channel channel, int brokerId, String address) {
-        if (isRegistered) {
-            log.warn("Broker {} attempting to register with leader again. Current isRegistered={}. This might be a re-registration attempt.", brokerId, isRegistered);
+        if (isRegistered && leaderChannel != null && leaderChannel.equals(channel)) { // Check if already registered via THIS channel
+            log.warn("Broker {} attempting to register with leader again via the same channel {}. Current isRegistered={}.", brokerId, channel.id(), isRegistered);
+        } else {
+            log.info("Broker {} attempting registration. Current isRegistered={}", brokerId, isRegistered);
         }
+
 
         Message registration = new Message(MessageType.BROKER_REGISTRATION, null,
                 String.format("{\"brokerId\":%d,\"address\":\"%s\"}", brokerId, address));
@@ -136,7 +163,8 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
 
         CompletableFuture<String> previousAck = registrationAcks.put(brokerId, ackFuture);
         if (previousAck != null && !previousAck.isDone()) {
-            previousAck.completeExceptionally(new IllegalStateException("Superseded by new registration attempt"));
+            log.warn("Superseding previous incomplete registration attempt for broker {}", brokerId);
+            previousAck.completeExceptionally(new IllegalStateException("Superseded by new registration attempt for broker " + brokerId));
         }
 
         log.info("Follower {} sending registration to leader via channel {}: {}", brokerId, channel.id(), registration.serialize());
@@ -144,7 +172,7 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
             if (!writeFuture.isSuccess()) {
                 log.error("Follower {} failed to send registration message to leader. Channel: {}, Cause: {}", brokerId, channel.id(), writeFuture.cause().getMessage(), writeFuture.cause());
                 ackFuture.completeExceptionally(writeFuture.cause());
-                registrationAcks.remove(brokerId, ackFuture);
+                registrationAcks.remove(brokerId, ackFuture); // Clean up if send failed
             } else {
                 log.info("Follower {} successfully sent registration request to leader. Waiting for ACK.", brokerId);
             }
@@ -153,10 +181,11 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
     }
 
     private void processMessageTask(MessageTask task) {
+        Message message = null;
         try {
-            Message message = Message.parse(task.getRawMessage());
+            message = Message.parse(task.getRawMessage());
             MessageType messageType = message.getType();
-            log.debug("Received message on channel {} of type {}: {}", task.getCtx().channel().id(), messageType, task.getRawMessage());
+            log.debug("Received message on channel {} of type {}: {}", task.getCtx().channel().id(), messageType, task.getRawMessage().length() > 200 ? task.getRawMessage().substring(0,200) + "..." : task.getRawMessage()); // Log snippet
             connectionRegistry.put(task.getCtx().channel(), messageType);
 
             switch (messageType) {
@@ -187,9 +216,15 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
             }
             log.debug("Successfully processed message type {}: {}", messageType, (message.getTopic() != null ? message.getTopic() : "N/A"));
         } catch (IllegalArgumentException e) {
-            log.error("Invalid message format received on channel {}: {}. Error: {}",task.getCtx().channel().id(), task.getRawMessage(), e.getMessage(), e);
+            log.error("Invalid message format received on channel {}: '{}'. Error: {}",task.getCtx().channel().id(), task.getRawMessage(), e.getMessage()); // No need to print stacktrace for this, message is enough
+            // Consider closing the channel for malformed messages if it's a protocol violation
+            task.getCtx().close();
         } catch (Exception e) {
-            log.error("Failed to process message on channel {}: {}. Error: {}", task.getCtx().channel().id(), task.getRawMessage(), e.getMessage(), e);
+            String topicInfo = (message != null && message.getTopic() != null) ? message.getTopic() : "N/A";
+            MessageType typeInfo = (message != null) ? message.getType() : MessageType.UNKNOWN;
+            log.error("Failed to process message (type: {}, topic: {}) on channel {}: '{}'. Error: {}",
+                    typeInfo, topicInfo, task.getCtx().channel().id(), task.getRawMessage(), e.getMessage(), e);
+            task.getCtx().close(); // Close on other unexpected errors during processing
         }
     }
 
@@ -219,11 +254,11 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
             } else if (clusterManager != null && clusterManager.isLeader()){
                 log.warn("Leader {} received a BROKER_ACK. This is unexpected. Message: {}", clusterManager.getBrokerId(), message.getContent());
             } else {
-                log.error("ClusterManager not available or role unclear while handling Broker ACK.");
+                log.error("ClusterManager not available or role unclear while handling Broker ACK on channel {}.", ctx.channel().id());
             }
             connectionRegistry.put(ctx.channel(), MessageType.BROKER);
         } catch (Exception e) {
-            log.error("Error processing BROKER_ACK: {}", message.getContent(), e);
+            log.error("Error processing BROKER_ACK from channel {}: {}", ctx.channel().id(), message.getContent(), e);
         }
     }
 
@@ -233,14 +268,20 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
         topicManager.addMessageToTopic(topic, message.getContent());
 
         ClusterManager clusterManager = ClusterContext.get();
+        if (clusterManager == null) {
+            log.error("ClusterManager is null in handleProducerMessage. Cannot determine leadership or replicate.");
+            return;
+        }
+
         if (clusterManager.isLeader()) {
             log.debug("Leader handling producer message for topic {}. Replicating...", topic);
             if (!partitionAssignments.containsKey(topic)) {
                 Optional<Topic> topicOpt = topicManager.getTopic(topic);
                 topicOpt.ifPresent(t -> {
-                    List<Integer> brokerIds = new ArrayList<>(clusterManager.getRegisteredBrokers().keySet());
-                    brokerIds.add(clusterManager.getBrokerId());
-                    assignPartitionsToBrokers(topic, brokerIds, t.getPartitions().size());
+                    List<Integer> brokerIdsForAssignment = new ArrayList<>(clusterManager.getRegisteredBrokers().keySet());
+                    brokerIdsForAssignment.add(clusterManager.getBrokerId());
+                    List<Integer> distinctBrokerIds = brokerIdsForAssignment.stream().distinct().collect(Collectors.toList());
+                    assignPartitionsToBrokers(topic, distinctBrokerIds, t.getPartitions().size());
                 });
             }
 
@@ -248,12 +289,16 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
                 replicateMessageToFollower(followerBrokerId, message);
             });
         } else {
-            log.warn("Follower received a PRODUCER message directly. Topic: {}", topic);
+            log.warn("Follower ID {} received a PRODUCER message directly for topic {}. Storing locally.", clusterManager.getBrokerId(), topic);
         }
     }
 
     private void connectToFollowerForReplication(int followerBrokerId, String followerAddress) {
         ClusterManager clusterManager = ClusterContext.get();
+        if (clusterManager == null) {
+            log.error("ClusterManager is null in connectToFollowerForReplication. Cannot determine leadership.");
+            return;
+        }
         if (!clusterManager.isLeader()) {
             log.warn("Non-leader broker ({}) attempted to connect to follower {}.", clusterManager.getBrokerId(), followerBrokerId);
             return;
@@ -261,7 +306,7 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
 
         Channel existingChannel = followerConnections.get(followerBrokerId);
         if (existingChannel != null && existingChannel.isActive()) {
-            log.info("Leader already has an active replication connection to follower {} at {}.", followerBrokerId, followerAddress);
+            log.info("Leader already has an active replication connection to follower {} at {} via channel {}.", followerBrokerId, followerAddress, existingChannel.id());
             return;
         }
         if (this.followerReplicationGroup == null || this.followerReplicationGroup.isShutdown() || this.followerReplicationGroup.isShuttingDown()) {
@@ -269,7 +314,7 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
             return;
         }
 
-        log.info("Leader attempting to establish replication connection to follower {} at {}", followerBrokerId, followerAddress);
+        log.info("Leader attempting to establish new replication connection to follower {} at {}", followerBrokerId, followerAddress);
         String[] hostPort = followerAddress.split(":");
         String host = hostPort[0];
         int port = Integer.parseInt(hostPort[1]);
@@ -281,9 +326,9 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
                     @Override
                     protected void initChannel(SocketChannel ch) {
                         ChannelPipeline pipeline = ch.pipeline();
-                        pipeline.addLast(new io.netty.handler.codec.LineBasedFrameDecoder(8192));
-                        pipeline.addLast(new StringEncoder());
-                        pipeline.addLast(new StringDecoder());
+                        pipeline.addLast(new LineBasedFrameDecoder(8192));
+                        pipeline.addLast(new StringEncoder(CharsetUtil.UTF_8));
+                        pipeline.addLast(new StringDecoder(CharsetUtil.UTF_8));
                     }
                 });
 
@@ -291,10 +336,10 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
             ChannelFuture future = bootstrap.connect(host, port).syncUninterruptibly();
             if (future.isSuccess()) {
                 Channel newFollowerChannel = future.channel();
-                log.info("Leader successfully connected to follower {} at {} for replication via channel {}.", followerBrokerId, followerAddress, newFollowerChannel.id());
+                log.info("Leader successfully connected to follower {} at {} for replication via new channel {}.", followerBrokerId, followerAddress, newFollowerChannel.id());
                 Channel oldChannel = followerConnections.put(followerBrokerId, newFollowerChannel);
-                if(oldChannel != null && oldChannel.isActive()){
-                    log.warn("Replaced an existing active channel for follower {} during connect.", followerBrokerId);
+                if(oldChannel != null && !oldChannel.equals(newFollowerChannel) && oldChannel.isActive()){
+                    log.warn("Replaced an existing active channel {} for follower {} during connect.", oldChannel.id(), followerBrokerId);
                     oldChannel.close();
                 }
                 newFollowerChannel.closeFuture().addListener(closeFuture -> {
@@ -312,7 +357,7 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
 
     private void replicateMessageToFollower(int followerBrokerId, Message originalMessage) {
         ClusterManager clusterManager = ClusterContext.get();
-        if (!clusterManager.isLeader()) return;
+        if (clusterManager == null || !clusterManager.isLeader()) return;
 
         Channel followerChannel = followerConnections.get(followerBrokerId);
 
@@ -326,26 +371,26 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
                 if (!future.isSuccess()) {
                     log.warn("Leader failed to send replica to follower {} via channel {}: {}. Closing channel.", followerBrokerId, followerChannel.id(), future.cause().getMessage(), future.cause());
                     followerChannel.close();
-                    followerConnections.remove(followerBrokerId, followerChannel);
+                    // Removal is handled by closeFuture listener in connectToFollowerForReplication
                 } else {
                     log.debug("Leader successfully sent replica to follower {} via channel {}", followerBrokerId, followerChannel.id());
                 }
             });
         } else {
-            log.warn("Leader: No active replication channel to follower {}. Message for topic {} not replicated. Attempting to establish connection.",
+            log.warn("Leader: No active replication channel to follower {}. Message for topic {} not replicated. Will attempt to establish connection.",
                     followerBrokerId, originalMessage.getTopic());
+            // Removing potentially stale/inactive channel entry before attempting to reconnect
             if (followerChannel != null) {
-                followerConnections.remove(followerBrokerId, followerChannel);
+                followerConnections.remove(followerBrokerId, followerChannel); // Ensure removal if instance was bad
             }
             String followerAddress = clusterManager.getRegisteredBrokers().get(followerBrokerId);
             if (followerAddress != null) {
                 connectToFollowerForReplication(followerBrokerId, followerAddress);
             } else {
-                log.warn("Leader: Address for follower {} not found in registered brokers. Cannot attempt to connect for replication.", followerBrokerId);
+                log.warn("Leader: Address for follower {} not found. Cannot connect for replication.", followerBrokerId);
             }
         }
     }
-
 
     private void handleConsumerMessage(ChannelHandlerContext ctx, Message message) {
         ConsumerMessage consumerMsg = null;
@@ -367,6 +412,8 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
                     break;
                 default:
                     log.warn("Unknown consumer action on channel {}: {}", ctx.channel().id(), consumerMsg.getAction());
+                    // If unknown action, we might just ignore or send a generic error.
+                    // For now, it falls through and does nothing further unless an error was thrown before.
                     break;
             }
         } catch (Exception e) {
@@ -388,7 +435,7 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
                     log.error("Error serializing/sending error POLL response to consumer on channel {}. Closing connection.", ctx.channel().id(), ex);
                     ctx.close();
                 }
-            } else {
+            } else { // Errors for COMMIT, HEARTBEAT, or parsing consumerMsg itself
                 log.warn("Closing connection with consumer on channel {} due to error processing {} request.", ctx.channel().id(), actionTypeInfo);
                 ctx.close();
             }
@@ -396,73 +443,99 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
     }
 
     private void handlePoll(ChannelHandlerContext ctx, ConsumerMessage msg) throws Exception {
+        ClusterManager currentClusterManager = ClusterContext.get();
+        if (currentClusterManager == null) {
+            log.error("CRITICAL: ClusterManager is null in handlePoll for consumer {}. Closing connection.", msg.getConsumerId());
+            if (ctx.channel().isActive()) {
+                BrokerPollResponse errorResponse = new BrokerPollResponse(-1, -1, "Broker internal error: Cluster configuration unavailable.", null, null);
+                ctx.writeAndFlush(mapper.writeValueAsString(errorResponse) + "\n").addListener(ChannelFutureListener.CLOSE);
+            }
+            return;
+        }
+
         String topic = msg.getTopic();
         String group = msg.getConsumerGroup();
         String consumerId = msg.getConsumerId();
 
-        consumerHeartbeats
-                .computeIfAbsent(group, g -> new ConcurrentHashMap<>())
-                .put(consumerId, System.currentTimeMillis());
+        if (group == null || consumerId == null || topic == null) {
+            log.warn("Received POLL request with null group, consumerId, or topic from channel {}. Group: {}, ConsumerId: {}, Topic: {}. Sending error.", ctx.channel().id(), group, consumerId, topic);
+            BrokerPollResponse errResponse = new BrokerPollResponse(-1, -1, "Invalid POLL request: group, consumerId, or topic is null.", null, null);
+            ctx.writeAndFlush(mapper.writeValueAsString(errResponse) + "\n");
+            return;
+        }
 
+        consumerHeartbeats.computeIfAbsent(group, k -> new ConcurrentHashMap<>()).put(consumerId, System.currentTimeMillis());
         maybeRebalance(group, topic);
 
-        Integer assignedPartition = consumerAssignments
-                .getOrDefault(group, Map.of())
-                .get(consumerId);
+        Map<String, List<Integer>> groupAssignments = this.consumerAssignments.get(group);
+        List<Integer> assignedPartitionsForThisConsumer = (groupAssignments != null) ?
+                groupAssignments.getOrDefault(consumerId, Collections.emptyList()) : Collections.emptyList();
 
-        if (assignedPartition == null) {
-            log.warn("Consumer {} in group {} for topic {} was not assigned a partition. Sending empty response.", consumerId, group, topic);
+        if (assignedPartitionsForThisConsumer.isEmpty()) {
+            log.warn("Consumer {} in group {} for topic {} has no partitions assigned on this broker ({}). Sending empty response.",
+                    consumerId, group, topic, currentClusterManager.getBrokerId());
             BrokerPollResponse emptyResponse = new BrokerPollResponse(-1, -1, null, null, null);
             ctx.writeAndFlush(mapper.writeValueAsString(emptyResponse) + "\n");
             return;
         }
 
-        final int partition = assignedPartition;
-        long committedOffset = committedOffsets
-                .getOrDefault(group, Map.of())
-                .getOrDefault(partition, 0L);
+        BrokerPollResponse responseToSend = null;
+        for (int partitionId : assignedPartitionsForThisConsumer) {
+            Integer ownerOfThisPartition = partitionAssignments.getOrDefault(topic, Collections.emptyMap()).get(partitionId);
 
-        BrokerPollResponse response;
-        ClusterManager currentClusterManager = ClusterContext.get();
-
-        if (currentClusterManager.isLeader()) {
-            Integer ownerBrokerId = partitionAssignments
-                    .getOrDefault(topic, Map.of())
-                    .get(partition);
-
-            if (ownerBrokerId == null) {
-                log.warn("Leader: Partition {} of topic {} is not assigned. Sending empty for consumer {}.", partition, topic, consumerId);
-                response = new BrokerPollResponse(partition, -1, null, null, null);
-            } else if (ownerBrokerId.equals(currentClusterManager.getBrokerId())) {
-                log.debug("Leader owns partition {}. Serving data for topic {} to consumer {}.", partition, topic, consumerId);
-                String nextMessage = topicManager.getMessageAtOffset(topic, partition, committedOffset);
-                response = (nextMessage != null) ? new BrokerPollResponse(partition, committedOffset, nextMessage)
-                        : new BrokerPollResponse(partition, -1, null);
-            } else {
-                String followerAddress = currentClusterManager.getRegisteredBrokers().get(ownerBrokerId);
-                if (followerAddress != null) {
-                    log.info("Leader: Redirecting consumer {} for topic {} partition {} to follower {} at {}.",
-                            consumerId, topic, partition, ownerBrokerId, followerAddress);
-                    response = new BrokerPollResponse(partition, -1, null, followerAddress, ownerBrokerId);
-                } else {
-                    log.warn("Leader: Follower {} owns topic {} partition {} but address not found. Sending empty for consumer {}.",
-                            ownerBrokerId, topic, partition, consumerId);
-                    response = new BrokerPollResponse(partition, -1, null, null, null);
+            if (!Integer.valueOf(currentClusterManager.getBrokerId()).equals(ownerOfThisPartition)) {
+                if (currentClusterManager.isLeader()) { // Leader knows true owner
+                    String followerAddress = currentClusterManager.getRegisteredBrokers().get(ownerOfThisPartition);
+                    if (followerAddress != null && ownerOfThisPartition != null) { // ownerOfThisPartition can't be null if not self
+                        log.info("Leader (ID {}): Consumer {} (channel {}) polled for partition {} (topic {}) which is owned by follower {}. Redirecting to {}.",
+                                currentClusterManager.getBrokerId(), consumerId, ctx.channel().id(), partitionId, topic, ownerOfThisPartition, followerAddress);
+                        responseToSend = new BrokerPollResponse(partitionId, -1, null, followerAddress, ownerOfThisPartition);
+                        break;
+                    } else {
+                        log.warn("Leader (ID {}): Consumer {} (channel {}) polled for partition {} (topic {}) owned by follower {} for whom address is not found. Cannot redirect.",
+                                currentClusterManager.getBrokerId(), consumerId, ctx.channel().id(), partitionId, topic, ownerOfThisPartition);
+                        continue;
+                    }
+                } else { // This is a Follower, but it was assigned a partition it doesn't own.
+                    log.error("Follower (ID {}) was assigned partition {} for topic {} but does not own it (True Owner: {}). This is an assignment error. Skipping partition.",
+                            currentClusterManager.getBrokerId(), partitionId, topic, ownerOfThisPartition);
+                    continue;
                 }
             }
-        } else {
-            log.debug("Follower handling poll for topic {}, partition {}, consumer {}.", topic, partition, consumerId);
-            String nextMessage = topicManager.getMessageAtOffset(topic, partition, committedOffset);
-            response = (nextMessage != null) ? new BrokerPollResponse(partition, committedOffset, nextMessage)
-                    : new BrokerPollResponse(partition, -1, null);
+
+            // Current broker owns this partitionId
+            long committedOffsetForPartition = committedOffsets
+                    .getOrDefault(group, Collections.emptyMap())
+                    .getOrDefault(partitionId, 0L);
+
+            String nextMessage = topicManager.getMessageAtOffset(topic, partitionId, committedOffsetForPartition);
+            if (nextMessage != null) {
+                log.debug("Broker {}: Found message for consumer {} in group {} on topic {} partition {} at offset {}",
+                        currentClusterManager.getBrokerId(), consumerId, group, topic, partitionId, committedOffsetForPartition);
+                responseToSend = new BrokerPollResponse(partitionId, committedOffsetForPartition, nextMessage);
+                break;
+            }
         }
-        ctx.writeAndFlush(mapper.writeValueAsString(response) + "\n");
+
+        if (responseToSend != null) { // Either a message or a redirect
+            ctx.writeAndFlush(mapper.writeValueAsString(responseToSend) + "\n");
+        } else { // No message found in any owned & assigned partition, and no redirect was applicable
+            int representativePartition = assignedPartitionsForThisConsumer.isEmpty() ? -1 : assignedPartitionsForThisConsumer.get(0);
+            log.debug("Broker {}: No new messages for consumer {} in group {} for topic {} across its assigned partitions (checked: {}). Sending empty response for partition {}.",
+                    currentClusterManager.getBrokerId(), consumerId, group, topic, assignedPartitionsForThisConsumer, representativePartition);
+            BrokerPollResponse emptyResponse = new BrokerPollResponse(representativePartition, -1, null, null, null);
+            ctx.writeAndFlush(mapper.writeValueAsString(emptyResponse) + "\n");
+        }
     }
 
 
     private void handleCommit(ChannelHandlerContext ctx, ConsumerMessage msg) {
-        log.info("Received COMMIT for topic={}, group={}, partition={}, offset={}",
-                msg.getTopic(), msg.getConsumerGroup(), msg.getPartition(), msg.getOffset());
+        if (msg.getConsumerGroup() == null) {
+            log.warn("Received COMMIT with null consumerGroup from consumer {} on channel {}. Ignoring.", msg.getConsumerId(), ctx.channel().id());
+            return;
+        }
+        log.info("Received COMMIT on channel {} for topic={}, group={}, partition={}, offset={}",
+                ctx.channel().id(), msg.getTopic(), msg.getConsumerGroup(), msg.getPartition(), msg.getOffset());
         committedOffsets
                 .computeIfAbsent(msg.getConsumerGroup(), k -> new ConcurrentHashMap<>())
                 .put(msg.getPartition(), msg.getOffset());
@@ -470,6 +543,11 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
 
 
     private void handleConsumerHeartbeat(ConsumerMessage msg) {
+        if (msg.getConsumerGroup() == null || msg.getConsumerId() == null) {
+            log.warn("Received HEARTBEAT with null consumerGroup or consumerId. Group: {}, ConsumerID: {}. Ignoring.",
+                    msg.getConsumerGroup(), msg.getConsumerId());
+            return;
+        }
         String group = msg.getConsumerGroup();
         String consumerId = msg.getConsumerId();
         consumerHeartbeats
@@ -489,8 +567,12 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
         }
 
         ClusterManager clusterManager = ClusterContext.get();
+        if (clusterManager == null) {
+            log.error("ClusterManager is null in handleBrokerRegistrationMessage. Cannot process registration from channel {}.", ctx.channel().id());
+            return;
+        }
         if (!clusterManager.isLeader()) {
-            log.warn("Non-leader broker received broker registration on channel {}. Ignoring. Message: {}", ctx.channel().id(), message.getContent());
+            log.warn("Non-leader broker ID {} received broker registration on channel {}. Ignoring. Message: {}", clusterManager.getBrokerId(), ctx.channel().id(), message.getContent());
             return;
         }
 
@@ -523,7 +605,7 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
             if (ctx.channel().isActive()) {
                 try {
                     Message nack = new Message(MessageType.BROKER_ACK, null,
-                            String.format("{\"status\":\"FAILURE\", \"message\":\"Error processing registration: %s\"}", e.getMessage()));
+                            String.format("{\"status\":\"FAILURE\", \"message\":\"Error processing registration: %s\"}", e.getMessage().replace("\"", "\\\"")));
                     ctx.writeAndFlush(nack.serialize() + "\n");
                 } catch (Exception ex) {
                     log.error("Leader failed to send NACK for registration on channel {}. Error: {}", ctx.channel().id(), ex.getMessage(), ex);
@@ -538,8 +620,12 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
 
     private void handleFollowerHeartbeat(ChannelHandlerContext ctx, Message message) {
         ClusterManager clusterManager = ClusterContext.get();
+        if (clusterManager == null) {
+            log.error("ClusterManager is null in handleFollowerHeartbeat. Cannot process heartbeat from channel {}.", ctx.channel().id());
+            return;
+        }
         if (!clusterManager.isLeader()) {
-            log.warn("Non-leader received follower heartbeat on channel {}. Ignoring.", ctx.channel().id());
+            log.warn("Non-leader ID {} received follower heartbeat on channel {}. Ignoring.", clusterManager.getBrokerId(), ctx.channel().id());
             return;
         }
         try {
@@ -601,6 +687,10 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
 
     private void reconnectToLeader() throws InterruptedException {
         ClusterManager clusterManager = ClusterContext.get();
+        if (clusterManager == null) {
+            log.error("ClusterManager is null in reconnectToLeader. Cannot determine role or leader info.");
+            return;
+        }
         if (clusterManager.isLeader()) {
             log.warn("Leader broker (ID {}) trying to reconnect to leader. This is unusual. Aborting.", clusterManager.getBrokerId());
             return;
@@ -610,13 +700,11 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
             return;
         }
 
-        // Close existing leaderChannel before attempting to reconnect to avoid multiple inconsistent channels
         if (this.leaderChannel != null && this.leaderChannel.isOpen()){
             log.info("Follower {}: Closing existing leader channel {} before reconnecting.", clusterManager.getBrokerId(), this.leaderChannel.id());
-            this.leaderChannel.close().awaitUninterruptibly(2, TimeUnit.SECONDS); // Wait briefly for close
-            this.leaderChannel = null; // Clear the reference
+            this.leaderChannel.close().awaitUninterruptibly(1, TimeUnit.SECONDS); // Shorter wait
+            this.leaderChannel = null;
         }
-
 
         log.info("Follower {} attempting to reconnect to leader at {}:{}",
                 clusterManager.getBrokerId(), clusterManager.getLeaderHost(), clusterManager.getLeaderPort());
@@ -628,9 +716,9 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
                     @Override
                     protected void initChannel(SocketChannel ch) {
                         ChannelPipeline pipeline = ch.pipeline();
-                        pipeline.addLast(new io.netty.handler.codec.LineBasedFrameDecoder(8192));
-                        pipeline.addLast(new StringDecoder());
-                        pipeline.addLast(new StringEncoder());
+                        pipeline.addLast(new LineBasedFrameDecoder(8192));
+                        pipeline.addLast(new StringDecoder(CharsetUtil.UTF_8));
+                        pipeline.addLast(new StringEncoder(CharsetUtil.UTF_8));
                         pipeline.addLast(MessageBrokerHandler.this);
                     }
                 });
@@ -650,7 +738,7 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
                 registrationFuture.thenAccept(ack -> log.info("Follower {} re-registration acknowledged by leader: {}", clusterManager.getBrokerId(), ack))
                         .exceptionally(ex -> {
                             log.error("Follower {} re-registration failed after reconnect: {}", clusterManager.getBrokerId(), ex.getMessage(), ex);
-                            if (this.leaderChannel != null && this.leaderChannel.isActive()) this.leaderChannel.close(); // Close if reg failed
+                            if (this.leaderChannel != null && this.leaderChannel.isActive()) this.leaderChannel.close();
                             return null;
                         });
             } else {
@@ -662,100 +750,163 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
         }
     }
 
-
     private void maybeRebalance(String group, String topic) {
-        log.debug("Checking for rebalance conditions for group {} and topic {}", group, topic);
-        Map<String, Long> groupHeartbeatsSource = this.consumerHeartbeats.computeIfAbsent(group, k -> new ConcurrentHashMap<>());
+        ClusterManager clusterManager = ClusterContext.get();
+        if (clusterManager == null) {
+            log.error("ClusterManager is null in maybeRebalance for group {}, topic {}. Cannot perform rebalance.", group, topic);
+            return;
+        }
+
+        int currentBrokerId = clusterManager.getBrokerId();
+        log.debug("Broker {} performing local rebalance check for group {} and topic {}", currentBrokerId, group, topic);
+
+        Map<String, Long> groupHeartbeats = this.consumerHeartbeats.computeIfAbsent(group, k -> new ConcurrentHashMap<>());
         long now = System.currentTimeMillis();
         final long heartbeatTimeoutMs = 30000;
 
         List<String> activeConsumerIds = new ArrayList<>();
-        new ArrayList<>(groupHeartbeatsSource.keySet()).forEach(consumerId -> {
-            Long lastHeartbeat = groupHeartbeatsSource.get(consumerId);
-            if (lastHeartbeat != null && (now - lastHeartbeat <= heartbeatTimeoutMs)) {
+        groupHeartbeats.forEach((consumerId, lastHeartbeat) -> {
+            if (now - lastHeartbeat <= heartbeatTimeoutMs) {
                 activeConsumerIds.add(consumerId);
+            }
+        });
+        // Clean up timed-out consumers from heartbeats and current assignments for this group
+        groupHeartbeats.entrySet().removeIf(entry -> {
+            boolean timedOut = now - entry.getValue() > heartbeatTimeoutMs;
+            if (timedOut) {
+                log.info("Consumer {} in group {} for topic {} on broker {} timed out. Removing from active list for rebalance.", entry.getKey(), group, topic, currentBrokerId);
+                Optional.ofNullable(this.consumerAssignments.get(group)).ifPresent(assignments -> assignments.remove(entry.getKey()));
+            }
+            return timedOut;
+        });
+
+        if (activeConsumerIds.isEmpty()) {
+            Map<String, List<Integer>> currentGroupAssignments = this.consumerAssignments.get(group);
+            if (currentGroupAssignments != null && !currentGroupAssignments.isEmpty()) {
+                log.info("No active consumers in group {} for topic {} on broker {}. Clearing all assignments for this group.", group, topic, currentBrokerId);
+                currentGroupAssignments.clear(); // Clear assignments for all consumers in this group
             } else {
-                log.info("Consumer {} in group {} for topic {} timed out. Removing.", consumerId, group, topic);
-                groupHeartbeatsSource.remove(consumerId);
-                consumerAssignments.getOrDefault(group, new ConcurrentHashMap<>()).remove(consumerId);
+                log.debug("No active consumers and no assignments to clear for group {} topic {} on broker {}.", group, topic, currentBrokerId);
             }
-        });
-
-        if (groupHeartbeatsSource.isEmpty()) {
-            this.consumerHeartbeats.remove(group);
-            this.consumerAssignments.remove(group);
-            log.info("No active consumers in group {} for topic {}. Cleared assignments.", group, topic);
             return;
         }
-        activeConsumerIds.sort(String::compareTo);
+        Collections.sort(activeConsumerIds); // For consistent assignment order
 
-        Map<String, Integer> currentAssignmentsForGroup = consumerAssignments.getOrDefault(group, Map.of());
-        boolean needsRebalance = currentAssignmentsForGroup.size() != activeConsumerIds.size() ||
-                activeConsumerIds.stream().anyMatch(cid -> !currentAssignmentsForGroup.containsKey(cid)) ||
-                !consumerAssignments.containsKey(group); // Rebalance if no assignments yet for group
-
-        if (!needsRebalance) {
-            log.debug("No change in active consumer set for group {} topic {}. Skipping rebalance.", group, topic);
-            return;
-        }
-
-        log.info("Performing rebalance for group {} and topic {}. Active consumers: {}", group, topic, activeConsumerIds);
-        Map<String, Integer> newAssignmentsForGroup = new ConcurrentHashMap<>();
         Optional<Topic> optionalTopic = topicManager.getTopic(topic);
-
         if (optionalTopic.isEmpty() || optionalTopic.get().getPartitions().isEmpty()) {
-            log.warn("Topic {} not found or has no partitions during rebalance for group {}. Clearing assignments.", topic, group);
-            consumerAssignments.put(group, newAssignmentsForGroup);
+            log.warn("Topic {} not found or has no partitions. Cannot rebalance for group {} on broker {}.", topic, group, currentBrokerId);
+            Map<String, List<Integer>> currentGroupAssignments = this.consumerAssignments.get(group);
+            if (currentGroupAssignments != null) currentGroupAssignments.clear();
             return;
         }
 
-        List<Integer> sortedPartitionIds = new ArrayList<>();
-        for (int i = 0; i < optionalTopic.get().getPartitions().size(); i++) sortedPartitionIds.add(i);
+        List<Integer> locallyOwnedPartitions = new ArrayList<>();
+        Map<Integer, Integer> topicPartitionOwners = this.partitionAssignments.getOrDefault(topic, Collections.emptyMap());
+        int totalPartitionsInTopic = optionalTopic.get().getPartitions().size();
 
-        for (int i = 0; i < sortedPartitionIds.size(); i++) {
-            if (activeConsumerIds.isEmpty()) break;
-            String consumerId = activeConsumerIds.get(i % activeConsumerIds.size());
-            newAssignmentsForGroup.put(consumerId, sortedPartitionIds.get(i));
-            log.info("REBALANCE: Assigning topic {} partition {} to consumer {} (group {}).",
-                    topic, sortedPartitionIds.get(i), consumerId, group);
+        for (int i = 0; i < totalPartitionsInTopic; i++) {
+            if (Integer.valueOf(currentBrokerId).equals(topicPartitionOwners.get(i))) {
+                locallyOwnedPartitions.add(i);
+            }
         }
-        activeConsumerIds.forEach(consumerId -> {
-            if (!newAssignmentsForGroup.containsKey(consumerId)) {
-                log.info("REBALANCE: Consumer {} (group {}) not assigned any partition for topic {} (more consumers than partitions or uneven distribution).",
-                        consumerId, group, topic);
+        Collections.sort(locallyOwnedPartitions);
+
+        if (locallyOwnedPartitions.isEmpty()) {
+            log.info("Broker {} owns no partitions for topic {}. Clearing assignments for group {}.", currentBrokerId, topic, group);
+            Map<String, List<Integer>> currentGroupAssignments = this.consumerAssignments.get(group);
+            if (currentGroupAssignments != null) currentGroupAssignments.clear();
+            return;
+        }
+
+        // Calculate proposed new assignments
+        Map<String, List<Integer>> proposedAssignments = new ConcurrentHashMap<>();
+        activeConsumerIds.forEach(cId -> proposedAssignments.put(cId, new ArrayList<>())); // Initialize lists
+
+        for (int i = 0; i < locallyOwnedPartitions.size(); i++) {
+            int partitionId = locallyOwnedPartitions.get(i);
+            String consumerId = activeConsumerIds.get(i % activeConsumerIds.size());
+            proposedAssignments.get(consumerId).add(partitionId);
+        }
+        proposedAssignments.values().forEach(Collections::sort); // Sort lists for consistent comparison
+
+        // Get current assignments for this group, or initialize if not present
+        Map<String, List<Integer>> currentGroupAssignments = this.consumerAssignments.computeIfAbsent(group, k -> new ConcurrentHashMap<>());
+        boolean assignmentsHaveChanged = false;
+
+        // Check if proposed assignments differ from current ones
+        if (currentGroupAssignments.size() != proposedAssignments.size() ||
+                !currentGroupAssignments.keySet().equals(proposedAssignments.keySet())) {
+            assignmentsHaveChanged = true;
+        } else {
+            for (Map.Entry<String, List<Integer>> entry : proposedAssignments.entrySet()) {
+                if (!currentGroupAssignments.get(entry.getKey()).equals(entry.getValue())) {
+                    assignmentsHaveChanged = true;
+                    break;
+                }
+            }
+        }
+        // Also consider consumers that were in currentAssignments but are no longer active
+        if(!assignmentsHaveChanged){
+            for(String existingConsumer : currentGroupAssignments.keySet()){
+                if(!activeConsumerIds.contains(existingConsumer)){
+                    assignmentsHaveChanged = true;
+                    break;
+                }
+            }
+        }
+
+
+        if (!assignmentsHaveChanged) {
+            log.debug("No change in assignments needed for group {} topic {} on broker {}. Current assignments: {}", group, topic, currentBrokerId, currentGroupAssignments);
+            return;
+        }
+
+        log.info("Performing rebalance on broker {} for group {} and topic {}. Active consumers: {}. Owned partitions: {}. Proposed assignments: {}",
+                currentBrokerId, group, topic, activeConsumerIds, locallyOwnedPartitions, proposedAssignments);
+
+        // Update assignments: remove inactive consumers, then update/add active ones
+        currentGroupAssignments.keySet().removeIf(consumerId -> !activeConsumerIds.contains(consumerId));
+        currentGroupAssignments.putAll(proposedAssignments);
+
+        log.info("Rebalance complete on broker {} for group {} topic {}. Final assignments: {}", currentBrokerId, group, topic, currentGroupAssignments);
+        currentGroupAssignments.forEach((consumer, partitions) -> {
+            if (partitions.isEmpty() && activeConsumerIds.contains(consumer)) { // Check if active consumer ended up with no partitions
+                log.info("REBALANCE (Broker {}): Active consumer {} (group {}) was not assigned any partitions for topic {}.", currentBrokerId, consumer, group, topic);
+            } else if (!partitions.isEmpty()){
+                log.info("REBALANCE (Broker {}): Consumer {} (group {}) assigned partitions {} for topic {}.", currentBrokerId, consumer, group, partitions, topic);
             }
         });
-        consumerAssignments.put(group, newAssignmentsForGroup);
-        log.info("Rebalance complete for group {} topic {}. Assignments: {}", group, topic, newAssignmentsForGroup);
     }
 
-    private void assignPartitionsToBrokers(String topic, List<Integer> brokerIds, int partitionCount) {
-        if (brokerIds.isEmpty()) {
-            log.warn("Cannot assign partitions for topic {}: no brokers available.", topic);
+    private void assignPartitionsToBrokers(String topic, List<Integer> allBrokerIdsInCluster, int partitionCount) {
+        if (allBrokerIdsInCluster.isEmpty()) {
+            log.warn("Cannot assign partitions for topic {}: no brokers available in cluster.", topic);
             return;
         }
-        Map<Integer, Integer> assignments = new ConcurrentHashMap<>();
+        Map<Integer, Integer> newTopicPartitionOwners = new ConcurrentHashMap<>();
         for (int i = 0; i < partitionCount; i++) {
-            int brokerId = brokerIds.get(i % brokerIds.size());
-            assignments.put(i, brokerId);
+            int ownerBrokerId = allBrokerIdsInCluster.get(i % allBrokerIdsInCluster.size());
+            newTopicPartitionOwners.put(i, ownerBrokerId);
         }
-        partitionAssignments.put(topic, assignments);
-        log.info("Leader assigned partitions for topic {}. Assignments: {}. Broker IDs used: {}", topic, assignments, brokerIds);
+        partitionAssignments.put(topic, newTopicPartitionOwners);
+        log.info("Leader assigned/updated partition ownership for topic {}. Assignments: {}. Brokers considered: {}", topic, newTopicPartitionOwners, allBrokerIdsInCluster);
     }
 
 
     public void shutdown() {
-        log.info("Shutting down MessageBrokerHandler...");
-        executorService.shutdown();
-        try {
-            if (!executorService.awaitTermination(5, TimeUnit.SECONDS)) {
-                log.warn("Executor service did not terminate in 5 seconds, forcing shutdown.");
+        log.info("Shutting down MessageBrokerHandler for broker ID: {}...", (ClusterContext.get() != null ? ClusterContext.get().getBrokerId() : "UNKNOWN"));
+        if (executorService != null && !executorService.isShutdown()) {
+            executorService.shutdown();
+            try {
+                if (!executorService.awaitTermination(5, TimeUnit.SECONDS)) {
+                    log.warn("Executor service did not terminate in 5 seconds, forcing shutdown.");
+                    executorService.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                log.warn("Shutdown of executor service interrupted.");
                 executorService.shutdownNow();
+                Thread.currentThread().interrupt();
             }
-        } catch (InterruptedException e) {
-            log.warn("Shutdown of executor service interrupted.");
-            executorService.shutdownNow();
-            Thread.currentThread().interrupt();
         }
 
         if (followerReplicationGroup != null && !followerReplicationGroup.isShutdown()) {
@@ -779,13 +930,13 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
             leaderChannel.close().awaitUninterruptibly(2, TimeUnit.SECONDS);
         }
 
-        log.info("Closing all other registered connections...");
+        log.info("Closing all other registered connections from connectionRegistry...");
         connectionRegistry.keySet().forEach(channel -> {
             if (channel.isActive()) channel.close();
         });
         connectionRegistry.clear();
 
-        log.info("MessageBrokerHandler shut down completed.");
+        log.info("MessageBrokerHandler shut down completed for broker ID: {}.", (ClusterContext.get() != null ? ClusterContext.get().getBrokerId() : "UNKNOWN"));
     }
 
 
