@@ -1,26 +1,34 @@
 package org.arpha.broker.handler.dto;
 
-import com.fasterxml.jackson.annotation.JsonCreator;
-import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import lombok.Getter;
+import lombok.Setter;
+import lombok.ToString;
 
 @Getter
+@Setter
+@ToString
+@JsonInclude(JsonInclude.Include.NON_NULL)
 public class BrokerPollResponse {
-    private final int partition;
-    private final long messageOffset;
-    private final String payload;
+    private int partition;
+    private long offset;
+    private String message;
 
-    @JsonCreator
-    public BrokerPollResponse(@JsonProperty("partition") int partition,
-                              @JsonProperty("messageOffset") long messageOffset,
-                              @JsonProperty("payload") String payload) {
-        this.partition = partition;
-        this.messageOffset = messageOffset;
-        this.payload = payload;
+    private String redirectToAddress;
+    private Integer redirectToBrokerId;
+
+    public BrokerPollResponse() {}
+
+    public BrokerPollResponse(int partition, long offset, String message) {
+        this(partition, offset, message, null, null);
     }
 
-    public boolean hasPayload() {
-        return payload != null;
+    public BrokerPollResponse(int partition, long offset, String message, String redirectToAddress, Integer redirectToBrokerId) {
+        this.partition = partition;
+        this.offset = offset;
+        this.message = message;
+        this.redirectToAddress = redirectToAddress;
+        this.redirectToBrokerId = redirectToBrokerId;
     }
 
 }

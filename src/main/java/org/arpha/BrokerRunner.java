@@ -70,7 +70,10 @@ public class BrokerRunner {
     private static ClusterManager getClusterManager(BrokerProperties brokerProperties) {
         ClusterManager clusterManager = new ClusterManager(brokerProperties.getId(),
                 brokerProperties.getLeaderProperties().host(),
-                brokerProperties.getLeaderProperties().port());
+                brokerProperties.getLeaderProperties().port(),
+                brokerProperties.getHost(),
+                brokerProperties.getPort()
+        );
 
         if (brokerProperties.isLeader()) {
             clusterManager.markAsLeader();

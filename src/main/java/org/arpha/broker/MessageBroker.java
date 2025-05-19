@@ -19,6 +19,7 @@ public class MessageBroker extends AbstractNettyServer {
     @Override
     protected void initChannel(SocketChannel socketChannel) {
         ChannelPipeline pipeline = socketChannel.pipeline();
+        pipeline.addLast(new io.netty.handler.codec.LineBasedFrameDecoder(8192));
         pipeline.addLast(new StringDecoder());
         pipeline.addLast(new StringEncoder());
         pipeline.addLast(messageBrokerHandler);

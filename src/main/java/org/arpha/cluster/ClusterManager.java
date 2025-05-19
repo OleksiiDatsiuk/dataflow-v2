@@ -13,17 +13,21 @@ public class ClusterManager {
     private final String leaderHost;
     private final int leaderPort;
     private boolean isLeader;
+    private String brokerHost;
+    private int brokerPort;
 
     private final Map<Integer, String> registeredBrokers = new ConcurrentHashMap<>();
     private final Map<Integer, BrokerStatus> brokerStatuses = new ConcurrentHashMap<>();
     private final Map<Integer, Long> heartbeatTimestamps = new ConcurrentHashMap<>();
 
 
-    public ClusterManager(int brokerId, String leaderHost, int leaderPort) {
+    public ClusterManager(int brokerId, String leaderHost, int leaderPort, String brokerHost, int brokerPort) {
         this.brokerId = brokerId;
         this.leaderHost = leaderHost;
         this.leaderPort = leaderPort;
         this.isLeader = false;
+        this.brokerHost = brokerHost;
+        this.brokerPort = brokerPort;
         this.brokerStatuses.put(brokerId, BrokerStatus.SELF);
     }
 
@@ -34,6 +38,14 @@ public class ClusterManager {
     public void markAsLeader() {
         this.isLeader = true;
         brokerStatuses.put(brokerId, BrokerStatus.LEADER);
+    }
+
+    public String getBrokerHost() {
+        return brokerHost;
+    }
+
+    public int getBrokerPort() {
+        return brokerPort;
     }
 
     public int getBrokerId() {
