@@ -460,7 +460,9 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
         if (group == null || consumerId == null || topic == null) {
             log.warn("Received POLL request with null group, consumerId, or topic from channel {}. Group: {}, ConsumerId: {}, Topic: {}. Sending error.", ctx.channel().id(), group, consumerId, topic);
             BrokerPollResponse errResponse = new BrokerPollResponse(-1, -1, "Invalid POLL request: group, consumerId, or topic is null.", null, null);
-            ctx.writeAndFlush(mapper.writeValueAsString(errResponse) + "\n");
+            if (ctx.channel().isActive()) {
+                ctx.writeAndFlush(mapper.writeValueAsString(errResponse) + "\n");
+            }
             return;
         }
 
@@ -468,63 +470,86 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
         maybeRebalance(group, topic);
 
         Map<String, List<Integer>> groupAssignments = this.consumerAssignments.get(group);
-        List<Integer> assignedPartitionsForThisConsumer = (groupAssignments != null) ?
+        List<Integer> assignedPartitionsForThisConsumerOnThisBroker = (groupAssignments != null) ?
                 groupAssignments.getOrDefault(consumerId, Collections.emptyList()) : Collections.emptyList();
 
-        if (assignedPartitionsForThisConsumer.isEmpty()) {
-            log.warn("Consumer {} in group {} for topic {} has no partitions assigned on this broker ({}). Sending empty response.",
+        if (assignedPartitionsForThisConsumerOnThisBroker.isEmpty()) {
+            log.warn("Consumer {} in group {} for topic {} has no partitions assigned on this broker (ID {}). This broker might not own partitions for this consumer or rebalance hasn't assigned any. Sending empty response.",
                     consumerId, group, topic, currentClusterManager.getBrokerId());
             BrokerPollResponse emptyResponse = new BrokerPollResponse(-1, -1, null, null, null);
-            ctx.writeAndFlush(mapper.writeValueAsString(emptyResponse) + "\n");
+            if (ctx.channel().isActive()) {
+                ctx.writeAndFlush(mapper.writeValueAsString(emptyResponse) + "\n");
+            }
             return;
         }
 
         BrokerPollResponse responseToSend = null;
-        for (int partitionId : assignedPartitionsForThisConsumer) {
-            Integer ownerOfThisPartition = partitionAssignments.getOrDefault(topic, Collections.emptyMap()).get(partitionId);
 
-            if (!Integer.valueOf(currentClusterManager.getBrokerId()).equals(ownerOfThisPartition)) {
-                if (currentClusterManager.isLeader()) { // Leader knows true owner
-                    String followerAddress = currentClusterManager.getRegisteredBrokers().get(ownerOfThisPartition);
-                    if (followerAddress != null && ownerOfThisPartition != null) { // ownerOfThisPartition can't be null if not self
-                        log.info("Leader (ID {}): Consumer {} (channel {}) polled for partition {} (topic {}) which is owned by follower {}. Redirecting to {}.",
-                                currentClusterManager.getBrokerId(), consumerId, ctx.channel().id(), partitionId, topic, ownerOfThisPartition, followerAddress);
-                        responseToSend = new BrokerPollResponse(partitionId, -1, null, followerAddress, ownerOfThisPartition);
-                        break;
-                    } else {
-                        log.warn("Leader (ID {}): Consumer {} (channel {}) polled for partition {} (topic {}) owned by follower {} for whom address is not found. Cannot redirect.",
-                                currentClusterManager.getBrokerId(), consumerId, ctx.channel().id(), partitionId, topic, ownerOfThisPartition);
-                        continue;
-                    }
-                } else { // This is a Follower, but it was assigned a partition it doesn't own.
-                    log.error("Follower (ID {}) was assigned partition {} for topic {} but does not own it (True Owner: {}). This is an assignment error. Skipping partition.",
-                            currentClusterManager.getBrokerId(), partitionId, topic, ownerOfThisPartition);
-                    continue;
-                }
+        for (int partitionId : assignedPartitionsForThisConsumerOnThisBroker) {
+            Integer globalOwnerBrokerId = partitionAssignments
+                    .getOrDefault(topic, Collections.emptyMap())
+                    .get(partitionId);
+
+            if (globalOwnerBrokerId == null) {
+                log.warn("Broker {}: No global owner found for topic '{}' partition {} in partitionAssignments. Consumer {}. This partition might be new or unassigned cluster-wide. Skipping.",
+                        currentClusterManager.getBrokerId(), topic, partitionId, consumerId);
+                continue;
             }
 
-            // Current broker owns this partitionId
-            long committedOffsetForPartition = committedOffsets
-                    .getOrDefault(group, Collections.emptyMap())
-                    .getOrDefault(partitionId, 0L);
+            if (Integer.valueOf(currentClusterManager.getBrokerId()).equals(globalOwnerBrokerId)) {
+                long committedOffsetForPartition = committedOffsets
+                        .getOrDefault(group, Collections.emptyMap())
+                        .getOrDefault(partitionId, 0L);
 
-            String nextMessage = topicManager.getMessageAtOffset(topic, partitionId, committedOffsetForPartition);
-            if (nextMessage != null) {
-                log.debug("Broker {}: Found message for consumer {} in group {} on topic {} partition {} at offset {}",
-                        currentClusterManager.getBrokerId(), consumerId, group, topic, partitionId, committedOffsetForPartition);
-                responseToSend = new BrokerPollResponse(partitionId, committedOffsetForPartition, nextMessage);
-                break;
+                String nextMessage = topicManager.getMessageAtOffset(topic, partitionId, committedOffsetForPartition);
+                if (nextMessage != null) {
+                    log.debug("Broker {} (Owner): Serving message for consumer {} in group {} on topic {} partition {} at offset {}",
+                            currentClusterManager.getBrokerId(), consumerId, group, topic, partitionId, committedOffsetForPartition);
+                    responseToSend = new BrokerPollResponse(partitionId, committedOffsetForPartition, nextMessage);
+                    break;
+                }
+            } else {
+                if (currentClusterManager.isLeader()) {
+                    String ownerAddress = currentClusterManager.getRegisteredBrokers().get(globalOwnerBrokerId);
+                    if (ownerAddress != null) {
+                        log.info("Leader (ID {}): Consumer {} (channel {}) polled for partition {} (topic {}) which is globally owned by broker {}. Redirecting to {}.",
+                                currentClusterManager.getBrokerId(), consumerId, ctx.channel().id(), partitionId, topic, globalOwnerBrokerId, ownerAddress);
+                        responseToSend = new BrokerPollResponse(partitionId, -1, null, ownerAddress, globalOwnerBrokerId);
+                        break;
+                    } else {
+                        log.warn("Leader (ID {}): Consumer {} (channel {}) polled for partition {} (topic {}) globally owned by broker {}, but owner's address not found. Cannot redirect. Consumer might need to retry or re-evaluate assignments.",
+                                currentClusterManager.getBrokerId(), consumerId, ctx.channel().id(), partitionId, topic, globalOwnerBrokerId);
+                    }
+                } else {
+                    log.warn("Follower (ID {}): Consumer {} (channel {}) polled for partition {} (topic {}) which this follower does not own (Global Owner: {}). This consumer should be polling the owner. Sending empty response for this poll cycle regarding this partition.",
+                            currentClusterManager.getBrokerId(), consumerId, ctx.channel().id(), partitionId, topic, globalOwnerBrokerId);
+                }
             }
         }
 
-        if (responseToSend != null) { // Either a message or a redirect
-            ctx.writeAndFlush(mapper.writeValueAsString(responseToSend) + "\n");
-        } else { // No message found in any owned & assigned partition, and no redirect was applicable
-            int representativePartition = assignedPartitionsForThisConsumer.isEmpty() ? -1 : assignedPartitionsForThisConsumer.get(0);
-            log.debug("Broker {}: No new messages for consumer {} in group {} for topic {} across its assigned partitions (checked: {}). Sending empty response for partition {}.",
-                    currentClusterManager.getBrokerId(), consumerId, group, topic, assignedPartitionsForThisConsumer, representativePartition);
+        if (responseToSend != null) {
+            if (ctx.channel().isActive()) {
+                ctx.writeAndFlush(mapper.writeValueAsString(responseToSend) + "\n");
+            }
+        } else {
+            int representativePartition = -1;
+            if (!assignedPartitionsForThisConsumerOnThisBroker.isEmpty()) {
+                for (int pId : assignedPartitionsForThisConsumerOnThisBroker) {
+                    Integer globalOwnerId = partitionAssignments.getOrDefault(topic, Collections.emptyMap()).get(pId);
+                    if (Integer.valueOf(currentClusterManager.getBrokerId()).equals(globalOwnerId)) {
+                        representativePartition = pId;
+                        break;
+                    }
+                }
+            }
+
+            log.debug("Broker {} (ID {}): No new messages for consumer {} in group {} for topic {} across its checked partitions. Sending empty response (context partition: {}).",
+                    currentClusterManager.isLeader() ? "Leader" : "Follower", currentClusterManager.getBrokerId(),
+                    consumerId, group, topic, representativePartition);
             BrokerPollResponse emptyResponse = new BrokerPollResponse(representativePartition, -1, null, null, null);
-            ctx.writeAndFlush(mapper.writeValueAsString(emptyResponse) + "\n");
+            if (ctx.channel().isActive()) {
+                ctx.writeAndFlush(mapper.writeValueAsString(emptyResponse) + "\n");
+            }
         }
     }
 
