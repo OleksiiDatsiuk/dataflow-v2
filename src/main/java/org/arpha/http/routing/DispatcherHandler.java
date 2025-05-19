@@ -12,6 +12,7 @@ import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.codec.http.HttpVersion;
 import lombok.SneakyThrows;
+import org.arpha.http.annotation.RequestBody;
 import org.arpha.http.common.HttpMethod;
 import org.arpha.http.annotation.PathParam;
 import org.arpha.http.streaming.SseStream;
@@ -30,15 +31,14 @@ public class DispatcherHandler extends SimpleChannelInboundHandler<FullHttpReque
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest request) {
-        if (HttpMethod.OPTIONS.equals(request.method())) {
+        String uri = request.uri().split("\\?")[0]; // remove query params
+        String method = request.method().name();
+
+        if (method.equals("OPTIONS")) {
             FullHttpResponse optionsResponse = buildOptionsResponse();
             ctx.writeAndFlush(optionsResponse).addListener(ChannelFutureListener.CLOSE);
             return;
         }
-
-
-        String uri = request.uri().split("\\?")[0]; // strip query parameters for route matching
-        String method = request.method().name();
 
         try {
             var routeMatchOpt = router.findRoute(uri, method);
@@ -60,6 +60,7 @@ public class DispatcherHandler extends SimpleChannelInboundHandler<FullHttpReque
         }
     }
 
+
     @SneakyThrows
     private Object invokeRoute(RouteMatch routeMatch, FullHttpRequest request, ChannelHandlerContext ctx) {
         Method handler = routeMatch.route().handlerMethod();
@@ -67,19 +68,34 @@ public class DispatcherHandler extends SimpleChannelInboundHandler<FullHttpReque
         Parameter[] parameters = handler.getParameters();
         Object[] args = new Object[parameters.length];
 
+        String requestBody = request.content().toString(java.nio.charset.StandardCharsets.UTF_8);
+
         for (int i = 0; i < parameters.length; i++) {
             Parameter param = parameters[i];
+
             if (param.getType().equals(FullHttpRequest.class)) {
                 args[i] = request;
+
             } else if (param.getType().equals(ChannelHandlerContext.class)) {
                 args[i] = ctx;
+
             } else if (param.isAnnotationPresent(PathParam.class)) {
                 String name = param.getAnnotation(PathParam.class).value();
                 args[i] = routeMatch.pathParams().get(name);
+
+            } else if (param.isAnnotationPresent(RequestBody.class)) {
+                if (param.getType().equals(String.class)) {
+                    args[i] = requestBody;
+                } else {
+                    args[i] = objectMapper.readValue(requestBody, param.getType());
+                }
+
             } else {
                 args[i] = getQueryParam(request.uri(), param.getName());
             }
         }
+
+
         return handler.invoke(controller, args);
     }
 

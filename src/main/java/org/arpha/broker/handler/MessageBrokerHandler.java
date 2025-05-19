@@ -19,6 +19,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.arpha.broker.component.Partition;
 import org.arpha.broker.component.Topic;
 import org.arpha.broker.component.manager.TopicManager;
+import org.arpha.broker.handler.dto.BrokerPollResponse;
 import org.arpha.broker.handler.dto.BrokerRegistrationMessage;
 import org.arpha.broker.handler.dto.ConsumerMessage;
 import org.arpha.cluster.ClusterContext;
@@ -40,6 +41,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
 
     private static volatile boolean isRegistered = false;
+    private static final ObjectMapper mapper = new ObjectMapper();
 
     private final TopicManager topicManager;
     private final Map<Channel, MessageType> connectionRegistry;
@@ -227,31 +229,58 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
 
         maybeRebalance(group, topic);
 
-        int partition = consumerAssignments
-                .computeIfAbsent(group, g -> new ConcurrentHashMap<>())
-                .computeIfAbsent(consumerId, c -> assignPartitionRoundRobin(topic, group));
+        Integer assignedPartition = consumerAssignments
+                .getOrDefault(group, Map.of())
+                .get(consumerId);
 
-        long offset = committedOffsets
+        if (assignedPartition == null) {
+            log.warn("Consumer {} in group {} for topic {} was not assigned a partition. Sending empty response.", consumerId, group, topic);
+            try {
+                BrokerPollResponse emptyResponse = new BrokerPollResponse(-1, -1, null);
+                ctx.writeAndFlush(mapper.writeValueAsString(emptyResponse) + "\n");
+            } catch (Exception e) {
+                log.error("Error sending empty unassigned partition response to consumer {}", consumerId, e);
+            }
+            return;
+        }
+
+        final int partition = assignedPartition;
+
+        long committedOffset = committedOffsets
                 .getOrDefault(group, Map.of())
                 .getOrDefault(partition, 0L);
 
         if (ClusterContext.get().isLeader()) {
-            Integer brokerId = partitionAssignments
+            Integer brokerIdForPartition = partitionAssignments
                     .getOrDefault(topic, Map.of())
                     .getOrDefault(partition, -1);
 
-            if (brokerId != ClusterContext.get().getBrokerId()) {
-                log.warn("Broker does not own partition {} of topic {}", partition, topic);
-                ctx.writeAndFlush("{}\n");
+            if (brokerIdForPartition == null || brokerIdForPartition != ClusterContext.get().getBrokerId()) {
+                log.warn("Broker (ID {}) does not own partition {} of topic {}. Assigned broker ID: {}. Sending empty response.",
+                        ClusterContext.get().getBrokerId(), partition, topic, brokerIdForPartition);
+                try {
+                    BrokerPollResponse emptyResponse = new BrokerPollResponse(partition, -1, null);
+                    ctx.writeAndFlush(mapper.writeValueAsString(emptyResponse) + "\n");
+                } catch (Exception e) {
+                    log.error("Error sending empty non-owned partition response to consumer {}", consumerId, e);
+                }
                 return;
             }
         }
 
-        String nextMessage = topicManager.getMessageAtOffset(topic, partition, offset);
+        String nextMessage = topicManager.getMessageAtOffset(topic, partition, committedOffset);
+        BrokerPollResponse response;
+
         if (nextMessage != null) {
-            ctx.writeAndFlush(nextMessage);
+            response = new BrokerPollResponse(partition, committedOffset, nextMessage);
         } else {
-            ctx.writeAndFlush("{}\n");
+            response = new BrokerPollResponse(partition, -1, null);
+        }
+
+        try {
+            ctx.writeAndFlush(mapper.writeValueAsString(response) + "\n");
+        } catch (Exception e) {
+            log.error("Error sending poll response to consumer {}: {}", consumerId, response, e);
         }
     }
 
@@ -388,25 +417,77 @@ public class MessageBrokerHandler extends SimpleChannelInboundHandler<String> {
     }
 
     private void maybeRebalance(String group, String topic) {
-        log.info("Checking if rebalance is needed for group {} and topic {}", group, topic);
-        Map<String, Long> groupHeartbeats = consumerHeartbeats.getOrDefault(group, Map.of());
+        log.info("Attempting rebalance for group {} and topic {}", group, topic);
+
+        Map<String, Long> groupHeartbeatsSource = this.consumerHeartbeats.computeIfAbsent(group, k -> new ConcurrentHashMap<>());
         long now = System.currentTimeMillis();
-        groupHeartbeats.entrySet().removeIf(entry -> now - entry.getValue() > 10000);
 
-        List<String> activeConsumers = new ArrayList<>(groupHeartbeats.keySet());
-        Optional<Topic> optionalTopic = topicManager.getTopic(topic);
-        if (optionalTopic.isEmpty()) return;
+        List<String> activeConsumerIds = new ArrayList<>();
+        new ArrayList<>(groupHeartbeatsSource.keySet()).forEach(consumerId -> {
+            Long lastHeartbeat = groupHeartbeatsSource.get(consumerId);
+            if (lastHeartbeat != null && (now - lastHeartbeat <= 10000)) {
+                activeConsumerIds.add(consumerId);
+            } else {
+                log.info("Consumer {} in group {} timed out or no heartbeat. Last heartbeat at {}. Removing for rebalance.",
+                        consumerId, group, lastHeartbeat == null ? "N/A" : lastHeartbeat);
+                groupHeartbeatsSource.remove(consumerId);
+            }
+        });
 
-        List<Partition> partitions = optionalTopic.get().getPartitions();
-        Map<String, Integer> newAssignment = new ConcurrentHashMap<>();
-
-        for (int i = 0; i < activeConsumers.size(); i++) {
-            String consumerId = activeConsumers.get(i);
-            int assignedPartition = i % partitions.size();
-            newAssignment.put(consumerId, assignedPartition);
+        if (groupHeartbeatsSource.isEmpty()) {
+            this.consumerHeartbeats.remove(group);
         }
 
-        consumerAssignments.put(group, newAssignment);
+        activeConsumerIds.sort(String::compareTo);
+
+        Map<String, Integer> newAssignmentsForGroup = new ConcurrentHashMap<>();
+
+        if (activeConsumerIds.isEmpty()) {
+            log.info("No active consumers in group {} for topic {}. Clearing assignments.", group, topic);
+            consumerAssignments.put(group, newAssignmentsForGroup);
+            return;
+        }
+
+        Optional<Topic> optionalTopic = topicManager.getTopic(topic);
+        if (optionalTopic.isEmpty()) {
+            log.warn("Topic {} not found. Cannot perform rebalance for group {}.", topic, group);
+            consumerAssignments.put(group, newAssignmentsForGroup);
+            return;
+        }
+
+        List<Partition> topicPartitionsList = optionalTopic.get().getPartitions();
+        if (topicPartitionsList.isEmpty()) {
+            log.warn("Topic {} has no partitions. Clearing assignments for group {}.", topic, group);
+            consumerAssignments.put(group, newAssignmentsForGroup);
+            return;
+        }
+
+        List<Integer> sortedPartitionIds = new ArrayList<>();
+        for (int i = 0; i < topicPartitionsList.size(); i++) {
+            sortedPartitionIds.add(i);
+        }
+        sortedPartitionIds.sort(Integer::compareTo);
+
+        for (int i = 0; i < activeConsumerIds.size(); i++) {
+            String consumerId = activeConsumerIds.get(i);
+            if (i < sortedPartitionIds.size()) {
+                Integer partitionToAssign = sortedPartitionIds.get(i);
+                newAssignmentsForGroup.put(consumerId, partitionToAssign);
+                log.info("REBALANCE: Assigning partition {} (topic {}) to consumer {} (group {}).",
+                        partitionToAssign, topic, consumerId, group);
+            } else {
+                log.info("REBALANCE: Consumer {} (group {}) not assigned a partition for topic {} (not enough partitions).",
+                        consumerId, group, topic);
+            }
+        }
+
+        if (sortedPartitionIds.size() > activeConsumerIds.size()) {
+            log.info("REBALANCE: {} partitions remain unassigned for topic {} in group {} as there are not enough active consumers ({} consumers, {} partitions).",
+                    sortedPartitionIds.size() - activeConsumerIds.size(), topic, group, activeConsumerIds.size(), sortedPartitionIds.size());
+        }
+
+        consumerAssignments.put(group, newAssignmentsForGroup);
+        log.info("Rebalance complete for group {} topic {}. Assignments: {}", group, topic, newAssignmentsForGroup);
     }
 
     private void assignPartitionsToBrokers(String topic, List<Integer> brokerIds, int partitionCount) {
